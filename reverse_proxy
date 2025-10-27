@@ -1,0 +1,92 @@
+# /root/install_checkmate_proxy.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+IP="${1:-}"; DNS="${2:-}"
+[[ -z "$IP" ]] && { echo "Usage: $0 <IP_LAN_VM> [DNS_OPTIONNEL]"; exit 1; }
+
+BASE="/opt/checkmate-proxy"
+mkdir -p "$BASE/certs" "$BASE/nginx"
+
+# Réseau partagé avec la stack Checkmate (existe déjà via l'étape 1)
+docker network create checkmate_net >/dev/null 2>&1 || true
+
+# OpenSSL conf avec SAN (IP + DNS si fourni)
+cat > "$BASE/certs/openssl.cnf" <<EOF
+[req]
+default_bits = 4096
+prompt = no
+default_md = sha256
+req_extensions = req_ext
+distinguished_name = dn
+[dn]
+CN = ${DNS:-$IP}
+[req_ext]
+subjectAltName = @alt_names
+[alt_names]
+IP.1 = ${IP}
+$( [[ -n "$DNS" ]] && echo "DNS.1 = ${DNS}" )
+EOF
+
+# Certificat auto-signé (2 ans)
+openssl req -x509 -nodes -days 730 -newkey rsa:4096 \
+  -keyout "$BASE/certs/server.key" \
+  -out "$BASE/certs/server.crt" \
+  -config "$BASE/certs/openssl.cnf"
+
+# Nginx conf — upstream explicite + headers corrects
+cat > "$BASE/nginx/default.conf" <<'CONF'
+upstream checkmate_upstream {
+    server server:52345;
+    keepalive 32;
+}
+server {
+  listen 443 ssl;
+  server_name _;
+
+  ssl_certificate     /etc/nginx/certs/server.crt;
+  ssl_certificate_key /etc/nginx/certs/server.key;
+  ssl_protocols TLSv1.2 TLSv1.3;
+  server_tokens off;
+
+  location / {
+    proxy_pass http://checkmate_upstream;
+    proxy_http_version 1.1;
+
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Upgrade $http_upgrade;
+
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Forwarded-Port 443;
+    proxy_set_header X-Forwarded-Proto https;
+
+    proxy_redirect off;
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+    proxy_buffering off;
+  }
+}
+CONF
+
+# Compose du proxy
+cat > "$BASE/docker-compose.yml" <<'YML'
+services:
+  nginx:
+    image: nginx:stable-alpine
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      - ./nginx:/etc/nginx/conf.d:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks: [ checkmate_net ]
+networks:
+  checkmate_net:
+    external: true
+YML
+
+cd "$BASE" && docker compose up -d
+echo "OK: https://$IP (cert auto-signé)$( [[ -n "$DNS" ]] && echo " | DNS: $DNS")"
